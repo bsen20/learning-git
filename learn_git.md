@@ -564,6 +564,288 @@ git bisect bad    # If this commit has the bug
 git bisect reset
 ```
 
+### Problem 7: "I force-pushed and lost my team's commits"
+
+**Scenario:** You ran `git push --force` on a shared branch, overwriting 5 commits your teammate had pushed 10 minutes ago. Panic ensues.
+
+**Solution:**
+```bash
+# 1. Immediately check reflog on YOUR local machine (if you had the commits)
+git reflog
+git push --force-with-lease origin HEAD:main   # Restore from reflog
+
+# 2. If you don't have the commits locally, check if anyone else has them:
+git fetch origin refs/heads/main               # Won't work — ref was overwritten
+
+# 3. Ask your teammate (who still has the commits locally) to force-push back:
+git push --force origin main                   # From teammate's machine
+
+# 4. If NO ONE has the commits locally — check GitHub's reflog (GHA):
+# Go to: your repo → Settings → "Dark mode" dropdown → "Moderation" → "Push logs"
+# Or contact GitHub Support within 90 days
+
+# 5. Prevention: ALWAYS use --force-with-lease instead of --force
+git push --force-with-lease origin main        # Aborts if remote has new commits
+```
+
+### Problem 8: "Submodule is stuck at a detached HEAD and won't update"
+
+**Scenario:** Your CI pipeline clones the repo but submodules are stuck at old commits and show "detached HEAD" warnings.
+
+**Solution:**
+```bash
+# Fix submodules recursively
+git submodule update --init --recursive --remote --force
+git submodule foreach --recursive git checkout main
+git submodule foreach --recursive git pull origin main
+
+# Commit the updated submodule pointers
+git add .
+git commit -m "chore: update submodules to latest"
+
+# For CI — use a single bulletproof command:
+git clone --recurse-submodules <url>
+git submodule update --init --checkout --recursive --force
+
+# To permanently pin submodules to specific branches:
+git config -f .gitmodules submodule.<path>.branch main
+git submodule sync
+```
+
+### Problem 9: "Someone committed a .env file with secrets. It's in the last 30 commits."
+
+**Scenario:** A developer accidentally committed AWS credentials in `.env` and pushed it. You need to remove it from ALL history — not just the latest commit.
+
+**Solution (git filter-repo — the modern approach):**
+```bash
+# Step 1: Install git-filter-repo
+pip install git-filter-repo
+
+# Step 2: Remove .env from entire history
+git filter-repo --path .env --invert-paths
+
+# Step 3: Also scrub any file containing the secret pattern
+git filter-repo --force --replace-text <(echo "AKIAIOSFODNN7EXAMPLE==>REDACTED")
+
+# Step 4: Force push the cleaned history to all branches
+git remote add origin <url>
+git push origin --force --all
+git push origin --force --tags
+
+# Step 5: IMMEDIATELY rotate the leaked credentials
+# In AWS: IAM → Users → Security credentials → Create new access key
+# Then: Invalidate the compromised key
+
+# Alternative with BFG (faster for large repos):
+java -jar bfg.jar --delete-files .env --no-blob-protection .
+git reflog expire --expire=now --all && git gc --prune=now --aggressive
+```
+
+**WARNING:** `filter-repo` rewrites history. Every collaborator must `git clone` fresh. Notify the entire team and rotate all exposed secrets immediately.
+
+### Problem 10: "I need to merge a long-lived branch that's 200 commits behind main"
+
+**Scenario:** A feature branch started 3 months ago and `main` has diverged significantly. Regular merge produces hundreds of conflicts.
+
+**Solution — strategic merge approach:**
+```bash
+# Step 1: Regular merge to baseline (accept all conflicts)
+git checkout feature/my-long-lived-branch
+git merge main
+# Accept all conflicts — we'll fix them systematically
+
+# Step 2: Use merge strategy to prefer our version for non-critical files
+git merge main --strategy-option=ours          # Keep feature branch version
+# OR
+git merge main --strategy-option=theirs        # Accept main's version
+
+# Step 3: Manual merge — checkout files from one side
+git checkout --ours -- src/specific-file.js    # Keep ours
+git checkout --theirs -- config/defaults.js    # Take theirs
+
+# Step 4: The recommended approach — incremental rebase
+# Break it into smaller chunks:
+git rebase --onto <commit-1-month-ago> HEAD~30   # Rebase last 30 commits first
+# Resolve conflicts for one month's worth of changes
+git rebase --continue
+
+# Then rebase the remaining commits:
+git rebase --onto main <commit-1-month-ago>
+# Now only 1 month of conflicts to resolve instead of 3
+
+# Step 5: If conflicts are still overwhelming, use merge with patience diff
+git merge main --no-ff
+git config --global diff.algorithm patience     # Produces cleaner diffs
+```
+
+**Prevention:** Rebase feature branches weekly: `git rebase main` every Monday morning.
+
+### Problem 11: "My CI pipeline is failing because of a flaky test — how do I skip it temporarily without reverting?"
+
+**Scenario:** An integration test is flaky (passes locally, fails in CI intermittently). You need to unblock the team while the test is fixed.
+
+**Solution:**
+```bash
+# Option A: Git revert + recommit (clean history)
+git revert <commit-that-added-flaky-test> --no-edit
+# Later when fixed:
+git revert <revert-commit> --no-edit
+
+# Option B: Rebase and drop the commit entirely
+git rebase -i HEAD~10
+# Change 'pick' to 'drop' for the flaky test commit
+# WARNING: Only if the commit is purely the test with no production code changes
+
+# Option C: Cherry-pick everything except the bad commit
+git checkout -b new-feature-branch main
+git cherry-pick <commit1> <commit2> <commit4>   # Skip commit3 (flaky test)
+
+# Option D: Create a fixup commit to disable the test
+# Make the test always pass (e.g., test.skip or it.skip)
+git add tests/flaky-test.spec.js
+git commit -m "fixup! original commit that added flaky test"
+git rebase -i --autosquash HEAD~5               # Auto-squash the fixup
+```
+
+**Best practice:** Never commit flaky tests to `main`. Use `@flaky` annotations or test retry mechanisms instead.
+
+### Problem 12: "I accidentally committed to main instead of a feature branch — and it's already pushed"
+
+**Scenario:** You made 3 commits directly to `main` and pushed them. These should have been on `feature/payments`.
+
+**Solution (already pushed):**
+```bash
+# Step 1: Create the feature branch at main's current position
+git branch feature/payments
+
+# Step 2: Revert main back to before your commits
+git checkout main
+git revert HEAD~3..HEAD --no-edit             # Creates 3 revert commits on main
+
+# Step 3: Push the reverted main
+git push origin main
+
+# Step 4: Push the feature branch
+git push origin feature/payments
+
+# Step 5: On the feature branch, revert the reverts to get original commits back
+git checkout feature/payments
+git revert HEAD~3..HEAD --no-edit             # Reverts the reverts — original code is back
+git push origin feature/payments
+
+# Alternative: cleaner approach with git reset (DANGEROUS — requires force push)
+# git checkout feature/payments
+# git push origin feature/payments
+# git checkout main
+# git reset --hard HEAD~3
+# git push --force-with-lease origin main     # Only if you have branch admin rights
+```
+
+### Problem 13: "Merge conflicts keep reappearing on the same files every time I rebase"
+
+**Scenario:** You're rebasing a feature branch and keep resolving the same conflicts in `package-lock.json` and `schema.sql` over and over.
+
+**Solution (rerere + strategic conflict resolution):**
+```bash
+# Step 1: Enable rerere
+git config --global rerere.enabled true
+
+# Step 2: For package-lock.json — use merge strategy
+git rebase main --strategy-option=theirs --strategy=recursive -Xtheirs
+# OR mark it as binary (no merge, just take one side):
+echo "package-lock.json merge=ours" >> .gitattributes
+git config merge.ours.driver true
+
+# Step 3: For schema.sql — manually resolve once, rerere remembers
+
+# Step 4: Use a custom merge driver for package-lock.json
+# Create a script at /usr/local/bin/keep-theirs.sh:
+: '
+#!/bin/sh
+cp -f "$3" "$2"    # Copy theirs into working tree
+exit 0
+'
+# Configure git to use it:
+git config merge.keep-theirs.driver "./keep-theirs.sh %O %A %B"
+echo "yarn.lock merge=keep-theirs" >> .gitattributes
+echo "package-lock.json merge=keep-theirs" >> .gitattributes
+
+# Step 5: Check rerere cache
+ls -la .git/rr-cache/                 # See stored resolutions
+git rerere status                     # Show current conflict status
+```
+
+### Problem 14: "Git is saying 'not a git repository' but there IS a .git folder"
+
+**Scenario:** `git status` returns `fatal: not a git repository` even though `ls -la | grep .git` confirms the directory exists.
+
+**Solution:**
+```bash
+# Step 1: Check if .git is valid
+file .git
+# If it says "broken symbolic link" — the repo was in a worktree config
+# If it says "ASCII text" — it's a gitfile pointing elsewhere
+
+# Step 2: If .git is a gitfile — check where it points
+cat .git
+# Output: gitdir: /path/to/actual/.git/worktrees/broken
+
+# Step 3: Fix by re-initializing (safe — keeps your files)
+git init
+
+# Step 4: If .git is corrupted — restore from backup or reflog
+git fsck --full                          # Check integrity
+git reflog --all                         # Check if objects exist
+
+# Step 5: Recovery — create a new repo and reconnect
+cp -r project project-backup             # ALWAYS backup first
+cd project
+mv .git .git-corrupted                   # Move corrupted git away
+git init                                 # Fresh repo
+git remote add origin <url>              # Reconnect remote
+git fetch origin                         # Fetch all objects from remote
+git checkout -b main origin/main         # Restore remote state
+# Now manually cherry-pick any unpushed commits from backup
+
+# Step 6: If .git directory is completely gone:
+git init
+git remote add origin <url>
+git fetch origin
+git reset --hard origin/main             # Reset to remote (loses local changes)
+```
+
+### Problem 15: "I need to move commits from one repo to another while preserving history"
+
+**Scenario:** You extracted a microservice and want to move its commit history from the monorepo to a new repo.
+
+**Solution:**
+```bash
+# Method 1: git subtree split (preserves full history for a subdirectory)
+cd monorepo
+git subtree split --prefix=services/payments -b payments-only
+git remote add payments-repo https://github.com/org/payments-service.git
+git push payments-repo payments-only:main
+
+# Method 2: git filter-repo (more control)
+git filter-repo --path services/payments/ --force
+git remote add origin https://github.com/org/payments-service.git
+git push origin main
+
+# Method 3: git filter-branch (legacy — slower but available everywhere)
+git filter-branch --prune-empty --subdirectory-filter services/payments main
+git remote add origin https://github.com/org/payments-service.git
+git push origin main
+
+# Method 4: Import into new repo while keeping monorepo intact
+cd /new-repo
+git remote add monorepo ../monorepo
+git fetch monorepo
+git merge monorepo/main --allow-unrelated-histories
+# Now use filter-repo to keep only the subdirectory:
+git filter-repo --path services/payments/ --force
+git remote remove monorepo
+```
+
 ---
 
 ## Git Best Practices for Senior Engineers
